@@ -52,6 +52,8 @@ CONFIG = {
                              # stall the logger's Bluetooth module, so keep this pause
     "outdir": os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"),
 }
+NMEA_OFF = "PMTK314," + ",".join("0" * 19)   # all NMEA sentences off
+NMEA_DEFAULT = [-1]          # PMTK314,-1 restores the default NMEA output
 MIN_CHUNK = 0x80             # smallest download block size that can be set
 
 
@@ -710,7 +712,7 @@ class App:
 
     # ---- connection
 
-    def connect(self):
+    def connect(self, nmea_warning=True):
         if self.dev:
             self.dev.close()
             self.dev = None
@@ -733,7 +735,7 @@ class App:
                     time.sleep(3)
             self.fw = self.dev.firmware()
             print(f"  Connected: {self.port} ({self.baud} bps) / {self.fw}")
-            if not any(int(x) for x in self.dev.query("PMTK414", "PMTK514,")[1:]):
+            if nmea_warning and not any(int(x) for x in self.dev.query("PMTK414", "PMTK514,")[1:]):
                 print("  * NMEA output is off (an interrupted Bluetooth download can leave it off).")
                 print("    Turn it on in 'GPS receiver settings > Restore default NMEA output'.")
         except DeviceError as e:
@@ -904,16 +906,19 @@ class App:
         convert(base + ".bin", st["format"])
 
     def nmea_off(self):
-        """Turn NMEA output off for a Bluetooth download. Returns the previous rates."""
+        """Turn NMEA output off for a Bluetooth download. Returns the rates to restore afterwards."""
         dev = self.dev
         try:
             rates = [int(x) for x in dev.query("PMTK414", "PMTK514,")[1:]]
-            if any(rates):
-                dev.command("PMTK314," + ",".join("0" * len(rates)))
-                time.sleep(0.5)
-                dev.flush_input()
-                print("  NMEA output turned off during the download.")
-                return rates
+            if not any(rates):
+                # Most likely left off by an interrupted download: restore the default output
+                print("  NMEA output is already off; the default output is restored afterwards.")
+                return NMEA_DEFAULT
+            dev.command(NMEA_OFF)
+            time.sleep(0.5)
+            dev.flush_input()
+            print("  NMEA output turned off during the download.")
+            return rates
         except DeviceError as e:
             print(f"  Could not turn NMEA output off ({e}), continuing.")
         return None
@@ -953,13 +958,13 @@ class App:
         """Reopen the port after the logger was power-cycled. A stalled Bluetooth module only
         recovers this way; the data received so far stays in memory."""
         ask("  Power-cycle the logger, wait until it is on, then press Enter: ")
-        self.connect()
+        self.connect(nmea_warning=False)    # NMEA output is off on purpose during the download
         if not self.dev or not self.fw:
             print("  Not connected. Check the logger and try again.")
             return False
         if saved_rates:
             try:
-                self.dev.command("PMTK314," + ",".join("0" * len(saved_rates)))
+                self.dev.command(NMEA_OFF)
                 time.sleep(0.5)
                 self.dev.flush_input()
             except DeviceError as e:
