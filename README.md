@@ -82,11 +82,16 @@ remote address, the incoming port carries `000000000000`.
 On a Bluetooth port the tool switches to a slower, safer mode:
 
 - waits up to 15 s for the link and retries the connection up to 3 times
-- 4 KB blocks with a 0.3 s pause between requests, up to 10 retries per block;
-  after 3 failures on a block the block size is halved (down to 128 bytes)
+- 4 KB blocks with a 0.3 s pause between requests; the block size never changes
 - NMEA output is turned off during the download and restored afterwards
-- when a block keeps failing, the data received so far is kept and you can
-  resume, **reconnect and resume after power-cycling the logger**, or save a `_partial` dump
+- fast give-up: a block that does not arrive within a few seconds is retried once
+  (*Bluetooth quick retries*, 0-5), and a stalled write gives up at once
+- after that the data received so far is kept and the tool asks you to
+  **power-cycle the logger, reconnect and resume** from the address where it stopped.
+  You can also resume without reconnecting, save a `_partial` dump, or discard it
+
+A stalled Bluetooth transfer does not recover on its own (seen on both Linux and Windows),
+and smaller blocks do not help, so the recovery path is always a power cycle and a reconnect.
 
 If a download was cut off while NMEA output was off, the next connection warns about it;
 use *GPS receiver settings > Restore default NMEA output*.

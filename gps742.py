@@ -47,11 +47,12 @@ CONFIG = {
     "rollover": "auto",      # auto | off
     "chunk": 0x800,          # download request size over USB (bytes)
     "bt_chunk": 0x1000,      # download request size over Bluetooth (bytes)
+    "bt_retries": 1,         # quick retries before asking to power-cycle and reconnect
     "bt_delay": 0.3,         # pause between Bluetooth requests (s); back-to-back requests
                              # stall the logger's Bluetooth module, so keep this pause
     "outdir": os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"),
 }
-MIN_CHUNK = 0x80             # smallest block when Bluetooth retries shrink the request
+MIN_CHUNK = 0x80             # smallest download block size that can be set
 
 
 # ---------------------------------------------------------------- NMEA/PMTK
@@ -248,11 +249,11 @@ class Mtk:
     def flash_id(self):
         return int(self.log_get(9), 16)
 
-    def read_memory(self, addr, length, timeout=10):
+    def read_memory(self, addr, length, timeout=None):
         """Read one memory block. Returns None on failure."""
         self.write(f"PMTK182,7,{addr:08X},{length:08X}")
         chunks = {}
-        for line in self.lines(timeout * self.tscale):
+        for line in self.lines(10 * self.tscale if timeout is None else timeout):
             if line.startswith("$PMTK182,8,"):
                 f = check_line(line)
                 if not f:
@@ -830,7 +831,7 @@ class App:
         base = os.path.join(CONFIG["outdir"], datetime.now().strftime("gps742_%Y%m%d_%H%M%S"))
         bt = dev.bluetooth
         chunk = CONFIG["bt_chunk"] if bt else CONFIG["chunk"]
-        retries = 10 if bt else 5
+        attempts = CONFIG["bt_retries"] + 1 if bt else 5
         print(f"  Downloading {total:,} bytes over {'Bluetooth' if bt else 'USB/serial'}, "
               f"{chunk} byte blocks (Ctrl+C to stop)")
         data = bytearray()
@@ -842,25 +843,30 @@ class App:
             while addr < total:
                 try:
                     size = min(chunk, total - addr)
+                    # Bluetooth: a block normally takes ~0.1 s + 0.22 s/KB, so give up quickly
+                    timeout = 3 + size / 1024 if bt else None
                     block = None
-                    for attempt in range(retries):
+                    for attempt in range(attempts):
                         if bt:
                             time.sleep(CONFIG["bt_delay"])
                         try:
-                            block = dev.read_memory(addr, size)
+                            block = dev.read_memory(addr, size, timeout)
                         except DeviceError:
-                            time.sleep(2)        # stalled write: give the link time to recover
+                            if bt:
+                                failures += 1
+                                break        # write timeout: the Bluetooth module has stalled
+                            time.sleep(2)
                         if block is not None:
                             break
                         failures += 1
                         dev.drain()
                         dev.flush_input()
-                        if bt and attempt >= 2 and chunk > MIN_CHUNK:
-                            chunk //= 2
-                            size = min(chunk, total - addr)
-                            print(f"\n  Retrying with {chunk} byte blocks", flush=True)
                     if block is None:
-                        print(f"\n  Reading 0x{addr:08X} failed {retries} times.")
+                        if bt:
+                            print(f"\n  Bluetooth transfer stopped at 0x{addr:08X}. The logger's Bluetooth"
+                                  "\n  module does not recover by itself: power-cycle the logger and choose 1.")
+                        else:
+                            print(f"\n  Reading 0x{addr:08X} failed {attempts} times.")
                         choice = self.download_failed(addr, total, saved_rates)
                     else:
                         data += block
@@ -930,13 +936,13 @@ class App:
         """Ask what to do after a failed or interrupted download. Data received so far is kept."""
         while True:
             print(f"  Received {addr:,} of {total:,} bytes.")
-            print("  1. Resume from here")
-            print("  2. Reconnect and resume (power-cycle the logger first)")
+            print("  1. Reconnect and resume (power-cycle the logger first)")
+            print("  2. Resume without reconnecting")
             print("  3. Save what was received\n  0. Discard")
             s = ask("Select> ")
-            if s == "1":
+            if s == "1" and self.reconnect_resume(saved_rates):
                 return "resume"
-            if s == "2" and self.reconnect_resume(saved_rates):
+            if s == "2":
                 return "resume"
             if s == "3":
                 return "save"
@@ -1149,6 +1155,11 @@ class App:
                 CONFIG[key] = int(v)
         return run
 
+    def set_bt_retries(self):
+        v = ask_number("  Bluetooth quick retries per block", CONFIG["bt_retries"], 0, 5)
+        if v is not None:
+            CONFIG["bt_retries"] = int(v)
+
     def set_outdir(self):
         p = ask(f"  Output folder [current {CONFIG['outdir']}, Enter=keep]: ")
         if p:
@@ -1194,6 +1205,7 @@ class App:
              self.set_chunk("chunk", "USB")),
             (lambda: f"Download block size (Bluetooth): {CONFIG['bt_chunk']} bytes",
              self.set_chunk("bt_chunk", "Bluetooth")),
+            (lambda: f"Bluetooth quick retries: {CONFIG['bt_retries']}", self.set_bt_retries),
             (lambda: f"Output folder: {CONFIG['outdir']}", self.set_outdir),
         ])
         return Menu("GPS742 logger manager", [
