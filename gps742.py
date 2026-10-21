@@ -45,8 +45,9 @@ FACTORY_DEFAULTS = {
 CONFIG = {
     "rollover": "auto",      # auto | off
     "chunk": 0x800,          # download request size over USB (bytes)
-    "bt_chunk": 0x200,       # download request size over Bluetooth (bytes)
-    "bt_delay": 0.3,         # pause between Bluetooth requests (s)
+    "bt_chunk": 0x1000,      # download request size over Bluetooth (bytes)
+    "bt_delay": 0.3,         # pause between Bluetooth requests (s); back-to-back requests
+                             # stall the logger's Bluetooth module, so keep this pause
     "outdir": os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"),
 }
 MIN_CHUNK = 0x80             # smallest block when Bluetooth retries shrink the request

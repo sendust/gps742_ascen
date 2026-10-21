@@ -56,8 +56,8 @@ Downloaded files are written to `logs/` next to the script:
 ## Bluetooth
 
 The GPS742 also offers a Bluetooth serial port (SPP). It works for settings and the live view,
-but downloads are slow (about 0.8 KB/s, roughly 20 minutes for 1 MB, versus about 30 s over USB)
-and the logger's Bluetooth module can stall in the middle of a long transfer.
+but downloads are slower (about 3 KB/s, roughly 5.5 minutes for 1 MB, versus about 30 s over USB)
+and the logger's Bluetooth module can stall in the middle of a transfer.
 **Use USB for downloads when you can.**
 
 Linux:
@@ -73,7 +73,7 @@ Windows: pair the logger, then pick its outgoing Bluetooth COM port from the lis
 On a Bluetooth port the tool switches to a slower, safer mode:
 
 - waits up to 15 s for the link and retries the connection up to 3 times
-- 512 byte blocks with a 0.3 s pause between requests, up to 10 retries per block;
+- 4 KB blocks with a 0.3 s pause between requests, up to 10 retries per block;
   after 3 failures on a block the block size is halved (down to 128 bytes)
 - NMEA output is turned off during the download and restored afterwards
 - when a block keeps failing, the data received so far is kept and you can
@@ -187,9 +187,15 @@ Observed on a GPS742 with firmware `AXN_1.30-B_1.3_C01,000D,TSI_747PRO,1.0`:
 - **Large reads can hang the firmware.** Interrupting a 64 KB read left the logger unresponsive
   until the USB cable was reconnected. The tool reads 2 KB blocks, waits for each acknowledgement,
   and drains pending output before retrying.
-- **Bluetooth stalls.** During long Bluetooth transfers the Bluetooth module can stop sending
-  (at a different point each time) while the GPS chip still answers over USB. Only a power cycle
-  of the logger brings the Bluetooth link back.
+- **Bluetooth stalls.** The Bluetooth module stops sending when commands arrive back-to-back:
+  with no pause between download requests it stalled within a few requests, with 0.1 s after
+  about 110 KB. The GPS chip keeps answering over USB, and only a power cycle of the logger
+  brings the Bluetooth link back. With a 0.3 s pause a full download succeeded.
+- **Bluetooth throughput.** Each request costs about 0.1 s plus about 0.22 s per KB (the dump is
+  sent as hex text), so the link tops out near 4.5 KB/s. Measured with a 0.3 s pause:
+  512 B blocks 1.0 KB/s, 1 KB 1.6 KB/s, 2 KB 2.35 KB/s, 4 KB 3.1 KB/s.
+- **NMEA output settings survive a power cycle.** A download that is cut off while NMEA output
+  is off leaves it off.
 - **Factory defaults.** `PMTK104` resets GPS receiver settings (e.g. DGPS mode back to WAAS/SBAS)
   but leaves the logger settings unchanged. *Restore factory defaults* therefore also writes the
   logger values from `FACTORY_DEFAULTS` in `gps742.py`: fields `0x0002003F` (UTC, valid, lat, lon,
