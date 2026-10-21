@@ -67,8 +67,17 @@ sudo rfcomm bind 0 <logger MAC address>      # creates /dev/rfcomm0 (group dialo
 python3 gps742.py                            # pick "/dev/rfcomm0  Bluetooth serial ..."
 ```
 
-Windows: pair the logger, then pick its outgoing Bluetooth COM port from the list
-(ports enumerated by `BTHENUM` are detected as Bluetooth).
+Windows: pair the logger in Bluetooth settings. Windows then creates two COM ports for it,
+an *outgoing* one (used to connect to the logger) and an *incoming* one. The port list shows
+the outgoing port with the logger's address and marks the incoming port as not usable:
+
+```
+  2. COM5           Standard Serial over Bluetooth link (COM5)  <- Bluetooth 00:1C:88:13:04:F8
+  4. COM6           Standard Serial over Bluetooth link (COM6)  (Bluetooth incoming port - cannot connect)
+```
+
+Both are recognised from the `BTHENUM\...` device instance ID; the outgoing port carries the
+remote address, the incoming port carries `000000000000`.
 
 On a Bluetooth port the tool switches to a slower, safer mode:
 

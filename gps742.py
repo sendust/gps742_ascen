@@ -11,6 +11,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -83,13 +84,34 @@ class DeviceError(Exception):
 ACK_TEXT = {0: "invalid command", 1: "unsupported command", 2: "failed", 3: "success"}
 
 
+def bt_port_info(p):
+    r"""(is_bluetooth, MAC address or None, is Windows incoming port) for a list_ports entry.
+
+    Windows creates two COM ports per paired SPP device. Their hwid is the device instance ID:
+      outgoing  BTHENUM\{00001101-...}_LOCALMFG&000F\7&2A6B8F2C&0&001C881304F8_C00000000
+      incoming  BTHENUM\{00001101-...}_LOCALMFG&0000\7&2A6B8F2C&0&000000000000_00000000
+    Only the outgoing port (it carries the remote address) can connect to the logger.
+    """
+    hwid = (p.hwid or "").upper()
+    if hwid.startswith("BTHENUM"):
+        m = re.search(r"&([0-9A-F]{12})_", hwid)
+        if not m:
+            return True, None, False
+        mac = m.group(1)
+        if mac == "0" * 12:
+            return True, None, True
+        return True, ":".join(mac[i:i + 2] for i in range(0, 12, 2)), False
+    bt = "rfcomm" in p.device or "bluetooth" in f"{p.device} {p.description}".lower()
+    return bt, None, False
+
+
 def is_bluetooth(port):
     """Linux /dev/rfcomm*, Windows COM ports enumerated by BTHENUM, macOS Bluetooth ports."""
     if "rfcomm" in port or "bluetooth" in port.lower():
         return True
     for p in list_ports.comports():
         if p.device == port:
-            return "BTHENUM" in (p.hwid or "").upper() or "bluetooth" in (p.description or "").lower()
+            return bt_port_info(p)[0]
     return False
 
 
@@ -627,9 +649,19 @@ def serial_ports():
              if (p.hwid and p.hwid != "n/a") or "rfcomm" in p.device]
     addrs = rfcomm_addresses()
     for p in ports:
+        bt, mac, incoming = bt_port_info(p)
+        p.tag = ""
         if "rfcomm" in p.device:
             p.description = f"Bluetooth serial {addrs.get(p.device, '')}".rstrip()
-    return sorted(ports, key=lambda p: (p.vid != MTK_VID and "rfcomm" not in p.device, p.device))
+        elif incoming:
+            p.tag = "  (Bluetooth incoming port - cannot connect)"
+        elif mac:
+            p.tag = f"  <- Bluetooth {mac}"
+        if p.vid == MTK_VID:
+            p.tag = "  <- MTK GPS"
+        # order: MTK USB, Bluetooth, other ports, Bluetooth incoming ports
+        p.rank = 0 if p.vid == MTK_VID else 1 if bt and not incoming else 3 if incoming else 2
+    return sorted(ports, key=lambda p: (p.rank, p.device))
 
 
 def select_port(current=None):
@@ -640,9 +672,8 @@ def select_port(current=None):
         print(" Select serial port")
         print("=" * 50)
         for i, p in enumerate(ports, 1):
-            tag = "  <- MTK GPS" if p.vid == MTK_VID else ""
             mark = " *" if p.device == current else ""
-            print(f" {i:2d}. {p.device:<14} {p.description}{tag}{mark}")
+            print(f" {i:2d}. {p.device:<14} {p.description}{p.tag}{mark}")
         if not ports:
             print("  (no serial ports found - connect the logger and rescan)")
         n = len(ports)
@@ -656,7 +687,12 @@ def select_port(current=None):
             continue
         k = int(s)
         if 1 <= k <= n:
-            return ports[k - 1].device
+            p = ports[k - 1]
+            if p.rank == 3 and not confirm(
+                    "  This is the Bluetooth incoming port; the logger connects through the\n"
+                    "  outgoing port (the one showing the Bluetooth address). Use it anyway?"):
+                continue
+            return p.device
         if k == n + 2:
             return ""
 
