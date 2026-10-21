@@ -12,6 +12,7 @@ import glob
 import json
 import os
 import struct
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -43,9 +44,12 @@ FACTORY_DEFAULTS = {
 
 CONFIG = {
     "rollover": "auto",      # auto | off
-    "chunk": 0x800,          # download request size (bytes)
+    "chunk": 0x800,          # download request size over USB (bytes)
+    "bt_chunk": 0x200,       # download request size over Bluetooth (bytes)
+    "bt_delay": 0.3,         # pause between Bluetooth requests (s)
     "outdir": os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"),
 }
+MIN_CHUNK = 0x80             # smallest block when Bluetooth retries shrink the request
 
 
 # ---------------------------------------------------------------- NMEA/PMTK
@@ -78,23 +82,63 @@ class DeviceError(Exception):
 ACK_TEXT = {0: "invalid command", 1: "unsupported command", 2: "failed", 3: "success"}
 
 
+def is_bluetooth(port):
+    """Linux /dev/rfcomm*, Windows COM ports enumerated by BTHENUM, macOS Bluetooth ports."""
+    if "rfcomm" in port or "bluetooth" in port.lower():
+        return True
+    for p in list_ports.comports():
+        if p.device == port:
+            return "BTHENUM" in (p.hwid or "").upper() or "bluetooth" in (p.description or "").lower()
+    return False
+
+
 class Mtk:
     def __init__(self, port, baud):
         self.port, self.baud = port, baud
+        self.bluetooth = is_bluetooth(port)
+        # A Bluetooth SPP link is set up when the port is opened and can stall for seconds
+        self.tscale = 2 if self.bluetooth else 1
         try:
-            self.ser = serial.Serial(port, baud, timeout=0.2, write_timeout=2)
+            self.ser = serial.Serial(port, baud, timeout=0.2,
+                                     write_timeout=10 if self.bluetooth else 2)
         except serial.SerialException as e:
             raise DeviceError(f"cannot open port: {e}")
         self.buf = b""
+        if self.bluetooth:
+            self.wait_link()
 
     def close(self):
         self.ser.close()
+        if self.bluetooth:
+            time.sleep(1)    # let the RFCOMM link close before the port is opened again
+
+    def wait_link(self, timeout=15):
+        """Wait for the first NMEA sentence so commands are not sent before the link is up."""
+        for line in self.lines(timeout):
+            if check_line(line):
+                return
+        # NMEA output may be off (e.g. after an interrupted download): try a test command
+        try:
+            self.write("PMTK000")
+            for line in self.lines(5):
+                if line.startswith("$PMTK001,0,"):
+                    return
+        except DeviceError:
+            pass
+        self.ser.close()
+        raise DeviceError("no data over Bluetooth. Power-cycle the logger and make sure no other "
+                          "PC or phone is connected to it.")
+
+    def stalled_hint(self):
+        if self.bluetooth:
+            return "Bluetooth link stalled. Power-cycle the logger or reconnect Bluetooth."
+        return "Reconnect the USB cable."
 
     def write(self, body):
         try:
             self.ser.write(make_cmd(body))
         except serial.SerialTimeoutException:
-            raise DeviceError("device does not accept commands (write timeout). Reconnect the USB cable.")
+            raise DeviceError(f"device does not accept commands (write timeout). {self.stalled_hint()}")
         except serial.SerialException as e:
             raise DeviceError(f"write error: {e}")
 
@@ -127,7 +171,7 @@ class Mtk:
         """Send a command and return the fields of the first reply starting with prefix."""
         for _ in range(retries + 1):
             self.write(body)
-            for line in self.lines(timeout):
+            for line in self.lines(timeout * self.tscale):
                 if line.startswith("$" + prefix):
                     f = check_line(line)
                     if f:
@@ -141,7 +185,7 @@ class Mtk:
         sub = parts[1] if num == "182" else None
         for _ in range(retries + 1):
             self.write(body)
-            for line in self.lines(timeout):
+            for line in self.lines(timeout * self.tscale):
                 if not line.startswith("$PMTK001,"):
                     continue
                 f = check_line(line)
@@ -185,7 +229,7 @@ class Mtk:
         """Read one memory block. Returns None on failure."""
         self.write(f"PMTK182,7,{addr:08X},{length:08X}")
         chunks = {}
-        for line in self.lines(timeout):
+        for line in self.lines(timeout * self.tscale):
             if line.startswith("$PMTK182,8,"):
                 f = check_line(line)
                 if not f:
@@ -561,10 +605,30 @@ class Menu:
             pause()
 
 
+def rfcomm_addresses():
+    """Map /dev/rfcommN to its bound Bluetooth address using the `rfcomm` tool, if present."""
+    try:
+        out = subprocess.run(["rfcomm"], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    addrs = {}
+    for line in out.splitlines():
+        name, _, rest = line.partition(":")
+        if name.startswith("rfcomm") and rest.split():
+            addrs["/dev/" + name] = rest.split()[0]
+    return addrs
+
+
 def serial_ports():
-    """Ports with real hardware behind them (skips placeholder /dev/ttyS* entries)."""
-    ports = [p for p in list_ports.comports() if p.hwid and p.hwid != "n/a"]
-    return sorted(ports, key=lambda p: (p.vid != MTK_VID, p.device))
+    """Ports with real hardware behind them (skips placeholder /dev/ttyS* entries).
+    Bluetooth /dev/rfcomm* ports have no hardware info but are kept."""
+    ports = [p for p in list_ports.comports()
+             if (p.hwid and p.hwid != "n/a") or "rfcomm" in p.device]
+    addrs = rfcomm_addresses()
+    for p in ports:
+        if "rfcomm" in p.device:
+            p.description = f"Bluetooth serial {addrs.get(p.device, '')}".rstrip()
+    return sorted(ports, key=lambda p: (p.vid != MTK_VID and "rfcomm" not in p.device, p.device))
 
 
 def select_port(current=None):
@@ -615,10 +679,25 @@ class App:
         self.fw = None
         if not self.port:
             return
+        bt = is_bluetooth(self.port)
+        if bt:
+            print(f"  Connecting to {self.port} over Bluetooth (up to 15 s)...")
         try:
-            self.dev = Mtk(self.port, self.baud)
+            # The first Bluetooth connection after the logger powers on can drop right away
+            for attempt in range(3 if bt else 1):
+                try:
+                    self.dev = Mtk(self.port, self.baud)
+                    break
+                except DeviceError as e:
+                    if attempt == (2 if bt else 0):
+                        raise
+                    print(f"  {e} - retrying")
+                    time.sleep(3)
             self.fw = self.dev.firmware()
             print(f"  Connected: {self.port} ({self.baud} bps) / {self.fw}")
+            if not any(int(x) for x in self.dev.query("PMTK414", "PMTK514,")[1:]):
+                print("  * NMEA output is off (an interrupted Bluetooth download can leave it off).")
+                print("    Turn it on in 'GPS receiver settings > Restore default NMEA output'.")
         except DeviceError as e:
             print(f"  Connection failed ({self.port}): {e}")
 
@@ -628,7 +707,10 @@ class App:
         return self.dev
 
     def top_header(self):
-        state = f"{self.port} ({self.baud} bps)" if self.dev else "not connected"
+        state = "not connected"
+        if self.dev:
+            link = "Bluetooth" if self.dev.bluetooth else "USB/serial"
+            state = f"{self.port} ({self.baud} bps, {link})"
         print(f"  Port    : {state}")
         if self.fw:
             print(f"  Firmware: {self.fw}")
@@ -709,35 +791,66 @@ class App:
             print("  * Logging is on. The logger keeps recording during the download.")
         os.makedirs(CONFIG["outdir"], exist_ok=True)
         base = os.path.join(CONFIG["outdir"], datetime.now().strftime("gps742_%Y%m%d_%H%M%S"))
-        print(f"  Downloading {total:,} bytes (Ctrl+C to stop)")
-        chunk = CONFIG["chunk"]
+        bt = dev.bluetooth
+        chunk = CONFIG["bt_chunk"] if bt else CONFIG["chunk"]
+        retries = 10 if bt else 5
+        print(f"  Downloading {total:,} bytes over {'Bluetooth' if bt else 'USB/serial'}, "
+              f"{chunk} byte blocks (Ctrl+C to stop)")
         data = bytearray()
         t0 = time.time()
         addr = 0
+        failures = 0
+        saved_rates = self.nmea_off() if bt else None
         try:
             while addr < total:
-                size = min(chunk, total - addr)
-                block = None
-                for attempt in range(5):
-                    block = dev.read_memory(addr, size)
-                    if block is not None:
-                        break
+                try:
+                    size = min(chunk, total - addr)
+                    block = None
+                    for attempt in range(retries):
+                        if bt:
+                            time.sleep(CONFIG["bt_delay"])
+                        try:
+                            block = dev.read_memory(addr, size)
+                        except DeviceError:
+                            time.sleep(2)        # stalled write: give the link time to recover
+                        if block is not None:
+                            break
+                        failures += 1
+                        dev.drain()
+                        dev.flush_input()
+                        if bt and attempt >= 2 and chunk > MIN_CHUNK:
+                            chunk //= 2
+                            size = min(chunk, total - addr)
+                            print(f"\n  Retrying with {chunk} byte blocks", flush=True)
+                    if block is None:
+                        print(f"\n  Reading 0x{addr:08X} failed {retries} times.")
+                        choice = self.download_failed(addr, total, saved_rates)
+                    else:
+                        data += block
+                        addr += size
+                        pct = addr * 100 // total
+                        rate = addr / max(time.time() - t0, 0.001) / 1024
+                        bar = "#" * (pct // 4)
+                        print(f"\r  [{bar:<25}] {pct:3d}%  {addr:,}/{total:,}  {rate:.1f} KB/s  "
+                              f"retries {failures}", end="", flush=True)
+                        continue
+                except KeyboardInterrupt:
+                    print("\n  Download paused. Waiting for the device output to settle...")
                     dev.drain()
                     dev.flush_input()
-                if block is None:
-                    raise DeviceError(f"reading 0x{addr:08X} failed 5 times.")
-                data += block
-                addr += size
-                pct = addr * 100 // total
-                rate = addr / max(time.time() - t0, 0.001) / 1024
-                bar = "#" * (pct // 4)
-                print(f"\r  [{bar:<25}] {pct:3d}%  {addr:,}/{total:,}  {rate:.1f} KB/s", end="", flush=True)
-        except KeyboardInterrupt:
-            print("\n  Download stopped. Waiting for the device output to settle...")
-            dev.drain()
-            dev.flush_input()
-            return
-        print(f"\n  Done in {time.time() - t0:.1f} s")
+                    choice = self.download_failed(addr, total, saved_rates)
+                if choice == "resume":
+                    dev = self.dev      # a new connection after "reconnect and resume"
+                    continue
+                if choice == "discard":
+                    print("  Download discarded.")
+                    return
+                base += "_partial"
+                break
+        finally:
+            if saved_rates:
+                self.nmea_restore(saved_rates)
+        print(f"\n  Received {len(data):,} bytes in {time.time() - t0:.1f} s, {failures} retries")
         with open(base + ".bin", "wb") as f:
             f.write(data)
         meta = {"firmware": self.fw, "port": self.port, "downloaded": datetime.now().isoformat(),
@@ -746,6 +859,69 @@ class App:
             json.dump(meta, f, ensure_ascii=False, indent=2)
         print(f"  Raw  : {base}.bin")
         convert(base + ".bin", st["format"])
+
+    def nmea_off(self):
+        """Turn NMEA output off for a Bluetooth download. Returns the previous rates."""
+        dev = self.dev
+        try:
+            rates = [int(x) for x in dev.query("PMTK414", "PMTK514,")[1:]]
+            if any(rates):
+                dev.command("PMTK314," + ",".join("0" * len(rates)))
+                time.sleep(0.5)
+                dev.flush_input()
+                print("  NMEA output turned off during the download.")
+                return rates
+        except DeviceError as e:
+            print(f"  Could not turn NMEA output off ({e}), continuing.")
+        return None
+
+    def nmea_restore(self, rates):
+        if not self.dev:
+            print("\n  [Error] NMEA output could not be restored (not connected). After reconnecting, use "
+                  "'GPS receiver settings > Restore default NMEA output'.")
+            return
+        try:
+            self.dev.drain()
+            self.dev.flush_input()
+            flag = self.dev.command("PMTK314," + ",".join(map(str, rates)))
+            print(f"\n  NMEA output restored: {ACK_TEXT.get(flag, flag)}")
+        except DeviceError as e:
+            print(f"\n  [Error] NMEA output could not be restored ({e}). After reconnecting, use "
+                  "'GPS receiver settings > Restore default NMEA output' to turn it back on.")
+
+    def download_failed(self, addr, total, saved_rates=None):
+        """Ask what to do after a failed or interrupted download. Data received so far is kept."""
+        while True:
+            print(f"  Received {addr:,} of {total:,} bytes.")
+            print("  1. Resume from here")
+            print("  2. Reconnect and resume (power-cycle the logger first)")
+            print("  3. Save what was received\n  0. Discard")
+            s = ask("Select> ")
+            if s == "1":
+                return "resume"
+            if s == "2" and self.reconnect_resume(saved_rates):
+                return "resume"
+            if s == "3":
+                return "save"
+            if s == "0":
+                return "discard"
+
+    def reconnect_resume(self, saved_rates):
+        """Reopen the port after the logger was power-cycled. A stalled Bluetooth module only
+        recovers this way; the data received so far stays in memory."""
+        ask("  Power-cycle the logger, wait until it is on, then press Enter: ")
+        self.connect()
+        if not self.dev or not self.fw:
+            print("  Not connected. Check the logger and try again.")
+            return False
+        if saved_rates:
+            try:
+                self.dev.command("PMTK314," + ",".join("0" * len(saved_rates)))
+                time.sleep(0.5)
+                self.dev.flush_input()
+            except DeviceError as e:
+                print(f"  Could not turn NMEA output off ({e}), continuing.")
+        return True
 
     def convert_existing(self):
         os.makedirs(CONFIG["outdir"], exist_ok=True)
@@ -901,6 +1077,9 @@ class App:
         rates[i] = int(v)
         report_ack(dev.command("PMTK314," + ",".join(map(str, rates))))
 
+    def nmea_default(self):
+        report_ack(self.need().command("PMTK314,-1"))
+
     def set_fix_rate(self):
         dev = self.need()
         cur = int(dev.query("PMTK400", "PMTK500,")[1])
@@ -926,10 +1105,12 @@ class App:
         CONFIG["rollover"] = "off" if CONFIG["rollover"] == "auto" else "auto"
         return "nopause"
 
-    def set_chunk(self):
-        v = ask_number("  Download block size (bytes)", CONFIG["chunk"], 256, 0x10000)
-        if v is not None:
-            CONFIG["chunk"] = int(v)
+    def set_chunk(self, key, name):
+        def run():
+            v = ask_number(f"  {name} download block size (bytes)", CONFIG[key], MIN_CHUNK, 0x10000)
+            if v is not None:
+                CONFIG[key] = int(v)
+        return run
 
     def set_outdir(self):
         p = ask(f"  Output folder [current {CONFIG['outdir']}, Enter=keep]: ")
@@ -963,6 +1144,7 @@ class App:
         ], header=self.settings_header)
         gps = Menu("GPS receiver settings", [
             ("NMEA output sentences", self.set_nmea),
+            ("Restore default NMEA output", self.nmea_default),
             ("Fix rate", self.set_fix_rate),
             ("SBAS on / off", self.toggle_sbas),
             ("DGPS mode", self.set_dgps),
@@ -971,7 +1153,10 @@ class App:
             ("Change port / baud rate", self.change_port),
             ("Reconnect", self.reconnect),
             (lambda: f"GPS week rollover fix: {CONFIG['rollover']}", self.toggle_rollover),
-            (lambda: f"Download block size: {CONFIG['chunk']} bytes", self.set_chunk),
+            (lambda: f"Download block size (USB): {CONFIG['chunk']} bytes",
+             self.set_chunk("chunk", "USB")),
+            (lambda: f"Download block size (Bluetooth): {CONFIG['bt_chunk']} bytes",
+             self.set_chunk("bt_chunk", "Bluetooth")),
             (lambda: f"Output folder: {CONFIG['outdir']}", self.set_outdir),
         ])
         return Menu("GPS742 logger manager", [
@@ -1011,7 +1196,8 @@ def format_rmc(f, gga, inview):
     t = "--"
     if len(hhmmss) >= 6 and len(date) == 6:
         dt = datetime.strptime(date + hhmmss[:6], "%d%m%y%H%M%S").replace(tzinfo=timezone.utc)
-        t = iso(fix_time(dt.timestamp()))
+        # 1980-01-06 is the GPS epoch: the receiver has no time yet (e.g. after a cold restart)
+        t = "time unknown" if date == "060180" else iso(fix_time(dt.timestamp()))
     if status != "A":
         return f"  {t}  no fix ({inview} satellites in view)"
     lat, lon = nmea_coord(f[3], f[4]), nmea_coord(f[5], f[6])

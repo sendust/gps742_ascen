@@ -53,6 +53,43 @@ Downloaded files are written to `logs/` next to the script:
 | `gps742_<date>_<time>.gpx` | all valid points, one `<trk>` per local date |
 | `gps742_<date>_<time>_<YYYY-MM-DD>.gpx` | one file per local date |
 
+## Bluetooth
+
+The GPS742 also offers a Bluetooth serial port (SPP). It works for settings and the live view,
+but downloads are slow (about 0.8 KB/s, roughly 20 minutes for 1 MB, versus about 30 s over USB)
+and the logger's Bluetooth module can stall in the middle of a long transfer.
+**Use USB for downloads when you can.**
+
+Linux:
+
+```bash
+sudo rfcomm bind 0 <logger MAC address>      # creates /dev/rfcomm0 (group dialout)
+python3 gps742.py                            # pick "/dev/rfcomm0  Bluetooth serial ..."
+```
+
+Windows: pair the logger, then pick its outgoing Bluetooth COM port from the list
+(ports enumerated by `BTHENUM` are detected as Bluetooth).
+
+On a Bluetooth port the tool switches to a slower, safer mode:
+
+- waits up to 15 s for the link and retries the connection up to 3 times
+- 512 byte blocks with a 0.3 s pause between requests, up to 10 retries per block;
+  after 3 failures on a block the block size is halved (down to 128 bytes)
+- NMEA output is turned off during the download and restored afterwards
+- when a block keeps failing, the data received so far is kept and you can
+  resume, **reconnect and resume after power-cycling the logger**, or save a `_partial` dump
+
+If a download was cut off while NMEA output was off, the next connection warns about it;
+use *GPS receiver settings > Restore default NMEA output*.
+
+ModemManager probes new serial ports with AT commands and can disturb the logger.
+If you do not use a modem, exclude rfcomm ports:
+
+```bash
+echo 'KERNEL=="rfcomm*", ENV{ID_MM_DEVICE_IGNORE}="1"' | sudo tee /etc/udev/rules.d/99-mm-ignore-rfcomm.rules
+sudo udevadm control --reload
+```
+
 ## Menu structure
 
 ```
@@ -84,15 +121,17 @@ GPS742 logger manager
 │   └── 7 Restore factory defaults
 ├── 4 GPS receiver settings
 │   ├── 1 NMEA output sentences
-│   ├── 2 Fix rate
-│   ├── 3 SBAS on / off
-│   └── 4 DGPS mode
+│   ├── 2 Restore default NMEA output
+│   ├── 3 Fix rate
+│   ├── 4 SBAS on / off
+│   └── 5 DGPS mode
 ├── 5 Connection / program settings
 │   ├── 1 Change port / baud rate
 │   ├── 2 Reconnect
 │   ├── 3 GPS week rollover fix (auto / off)
-│   ├── 4 Download block size
-│   └── 5 Output folder
+│   ├── 4 Download block size (USB)
+│   ├── 5 Download block size (Bluetooth)
+│   └── 6 Output folder
 └── 0 Exit
 ```
 
@@ -126,6 +165,8 @@ All commands are `$<body>*<XOR checksum>\r\n`.
 | `PMTK220` / `PMTK400` | set / query fix rate |
 | `PMTK313` / `PMTK413` | set / query SBAS |
 | `PMTK301` / `PMTK401` | set / query DGPS mode |
+| `PMTK314,-1` | restore default NMEA output |
+| `PMTK000` | test command (link check) |
 | `PMTK101` / `102` / `103` | hot / warm / cold restart |
 | `PMTK104` | full cold restart, resets GPS receiver settings (not logger settings) |
 
@@ -146,6 +187,9 @@ Observed on a GPS742 with firmware `AXN_1.30-B_1.3_C01,000D,TSI_747PRO,1.0`:
 - **Large reads can hang the firmware.** Interrupting a 64 KB read left the logger unresponsive
   until the USB cable was reconnected. The tool reads 2 KB blocks, waits for each acknowledgement,
   and drains pending output before retrying.
+- **Bluetooth stalls.** During long Bluetooth transfers the Bluetooth module can stop sending
+  (at a different point each time) while the GPS chip still answers over USB. Only a power cycle
+  of the logger brings the Bluetooth link back.
 - **Factory defaults.** `PMTK104` resets GPS receiver settings (e.g. DGPS mode back to WAAS/SBAS)
   but leaves the logger settings unchanged. *Restore factory defaults* therefore also writes the
   logger values from `FACTORY_DEFAULTS` in `gps742.py`: fields `0x0002003F` (UTC, valid, lat, lon,
