@@ -150,11 +150,11 @@ In prompts that ask for a value, an empty Enter cancels.
 
 ## Screenshots
 
-Port selection, top menu and logger settings:
+Port selection, top menu and logger settings over Bluetooth (`/dev/rfcomm0`):
 
 ![CLI menu](docs/cli_menu.png)
 
-Log download:
+Log download over Bluetooth (4 KB blocks, NMEA output off during the transfer):
 
 ![CLI download](docs/cli_download.png)
 
