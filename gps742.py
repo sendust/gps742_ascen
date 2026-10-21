@@ -30,6 +30,17 @@ GPS_WEEK_ROLLOVER = 1024 * 7 * 86400
 ROLLOVER_THRESHOLD = datetime(2012, 1, 1, tzinfo=timezone.utc).timestamp()
 MTK_VID = 0x0E8D
 
+# Logger values written by "Restore factory defaults" (PMTK182,1,<param>,<value>).
+# PMTK104 does not reset these on the GPS742, so they are written one by one.
+# key: (param, value, label)
+FACTORY_DEFAULTS = {
+    "format": (2, 0x0002003F, "Fields"),     # UTC, valid, lat, lon, height, speed, RCR
+    "period": (3, 10, "Time interval"),      # 0.1 s units -> 1 s
+    "distance": (4, 20, "Distance"),         # 0.1 m units -> 2 m
+    "speed": (5, 0, "Speed"),                # disabled
+    "mode": (6, 2, "When full"),             # 1 overwrite, 2 stop logging
+}
+
 CONFIG = {
     "rollover": "auto",      # auto | off
     "chunk": 0x800,          # download request size (bytes)
@@ -804,6 +815,32 @@ class App:
             report_ack(dev.command("PMTK182,4"))
             print("  Logging started.")
 
+    def factory_defaults(self):
+        dev = self.need()
+        st = dev.log_status()
+        print(f"  {'Setting':<15} {'Current':<22} Default")
+        for key, (_, value, label) in FACTORY_DEFAULTS.items():
+            print(f"  {label:<15} {setting_text(key, st[key]):<22} {setting_text(key, value)}")
+        print("\n  GPS receiver settings (DGPS, SBAS, ...) are also reset with a full cold")
+        print("  restart (PMTK104). Getting a new fix may take a few minutes.")
+        print("  Stored log data is not erased.")
+        if not confirm("  Restore factory defaults?"):
+            print("  Cancelled.")
+            return
+        dev.write("PMTK104")
+        restarted = any(line.startswith("$PMTK010,001") for line in dev.lines(8))
+        print(f"  Full cold restart: {'done' if restarted else 'no restart message (continuing)'}")
+        dev.flush_input()
+        for key, (param, value, label) in FACTORY_DEFAULTS.items():
+            if st[key] == value:
+                continue
+            flag = dev.log_set(param, f"{value:08X}" if key == "format" else value)
+            print(f"  {label:<15} -> {setting_text(key, value)}: {ACK_TEXT.get(flag, flag)}")
+        st = dev.log_status()
+        bad = [label for key, (_, value, label) in FACTORY_DEFAULTS.items() if st[key] != value]
+        print("  All logger settings are at factory defaults." if not bad
+              else f"  [Error] still different: {', '.join(bad)}")
+
     def edit_format(self):
         dev = self.need()
         fmt = dev.log_status()["format"]
@@ -922,6 +959,7 @@ class App:
             ("Set speed interval", self.set_interval(5, "speed", "Speed interval", "km/h", 1000)),
             ("When memory is full", self.set_mode),
             ("Select log fields", self.edit_format),
+            ("Restore factory defaults", self.factory_defaults),
         ], header=self.settings_header)
         gps = Menu("GPS receiver settings", [
             ("NMEA output sentences", self.set_nmea),
@@ -951,6 +989,14 @@ def record_size(fmt):
 
 def fmt_interval(v, unit):
     return "disabled" if v == 0 else f"{v / 10:g} {unit}"
+
+
+def setting_text(key, value):
+    if key == "format":
+        return f"0x{value:08X}"
+    if key == "mode":
+        return "overwrite" if value == 1 else "stop logging"
+    return fmt_interval(value, {"period": "s", "distance": "m", "speed": "km/h"}[key])
 
 
 def nmea_coord(v, hemi):

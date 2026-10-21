@@ -14,6 +14,7 @@ change logger settings, download the log memory, and convert it to CSV and GPX.
 - Full log download with per-block checksum check and retry
 - Converts the raw dump to CSV and GPX (one track per local date, plus one GPX file per date)
 - Logger settings: start/stop logging, time/distance/speed interval, overwrite or stop when full, log fields
+- Restore factory defaults: logger settings plus a full cold restart for the GPS receiver settings
 - GPS receiver settings: NMEA output sentences, fix rate, SBAS, DGPS
 - GPS week rollover correction (see [Device notes](#device-notes))
 
@@ -79,7 +80,8 @@ GPS742 logger manager
 │   ├── 3 Set distance interval
 │   ├── 4 Set speed interval
 │   ├── 5 When memory is full (overwrite / stop)
-│   └── 6 Select log fields
+│   ├── 6 Select log fields
+│   └── 7 Restore factory defaults
 ├── 4 GPS receiver settings
 │   ├── 1 NMEA output sentences
 │   ├── 2 Fix rate
@@ -95,7 +97,7 @@ GPS742 logger manager
 ```
 
 Settings screens show the current values read from the device each time they are opened.
-Erasing the log memory asks you to type `erase`; restarts ask for `yes`.
+Erasing the log memory asks you to type `erase`; restarts and restoring factory defaults ask for `yes`.
 In prompts that ask for a value, an empty Enter cancels.
 
 ## Screenshots
@@ -125,6 +127,7 @@ All commands are `$<body>*<XOR checksum>\r\n`.
 | `PMTK313` / `PMTK413` | set / query SBAS |
 | `PMTK301` / `PMTK401` | set / query DGPS mode |
 | `PMTK101` / `102` / `103` | hot / warm / cold restart |
+| `PMTK104` | full cold restart, resets GPS receiver settings (not logger settings) |
 
 Commands are acknowledged with `$PMTK001,<cmd>,[<sub>,]<flag>` (3 = success).
 Time, distance and speed intervals are stored in units of 0.1 s, 0.1 m and 0.1 km/h.
@@ -143,5 +146,10 @@ Observed on a GPS742 with firmware `AXN_1.30-B_1.3_C01,000D,TSI_747PRO,1.0`:
 - **Large reads can hang the firmware.** Interrupting a 64 KB read left the logger unresponsive
   until the USB cable was reconnected. The tool reads 2 KB blocks, waits for each acknowledgement,
   and drains pending output before retrying.
+- **Factory defaults.** `PMTK104` resets GPS receiver settings (e.g. DGPS mode back to WAAS/SBAS)
+  but leaves the logger settings unchanged. *Restore factory defaults* therefore also writes the
+  logger values from `FACTORY_DEFAULTS` in `gps742.py`: fields `0x0002003F` (UTC, valid, lat, lon,
+  height, speed, RCR), 1 s, 2 m, speed disabled, stop logging when full. Edit that table if your
+  unit ships with different values.
 - Old tracks stay in memory until it is erased, so a download can contain several trips.
   Use the per-date GPX files when importing into a map app.
