@@ -52,8 +52,13 @@ CONFIG = {
     "chunk": 0x800,          # download request size over USB (bytes)
     "bt_chunk": 0x1000,      # download request size over Bluetooth (bytes)
     "bt_retries": 1,         # quick retries before asking to power-cycle and reconnect
-    "bt_delay": 0.3,         # pause between Bluetooth requests (s); back-to-back requests
-                             # stall the logger's Bluetooth module, so keep this pause
+    "bt_delay": 0.0,         # pause between Bluetooth requests (s). No pause was needed with a
+                             # Realtek RTL8761BU dongle; raise it if the Bluetooth module stalls
+    # Send each Bluetooth command in small pieces with a pause in between, as Ascen's
+    # gpsPhotoTagger does in its fast download mode, so the module's input buffer is not overrun
+    "bt_slow_write": False,
+    "slow_write_piece": 6,   # bytes per piece
+    "slow_write_gap": 0.1,   # pause after each piece (s)
     # 7-day MTK EPO (AGPS) file, the source used by Ascen's gpsPhotoTagger
     "epo_url": "http://www.qstarz.com/ftp_folder/AGPS/MTK7d.BIN",
     "outdir": os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"),
@@ -171,7 +176,15 @@ class Mtk:
 
     def write(self, body):
         try:
-            self.ser.write(make_cmd(body))
+            data = make_cmd(body)
+            if self.bluetooth and CONFIG["bt_slow_write"]:
+                n = CONFIG["slow_write_piece"]
+                for i in range(0, len(data), n):
+                    self.ser.write(data[i:i + n])
+                    self.ser.flush()
+                    time.sleep(CONFIG["slow_write_gap"])
+            else:
+                self.ser.write(data)
         except serial.SerialTimeoutException:
             raise DeviceError(f"device does not accept commands (write timeout). {self.stalled_hint()}")
         except serial.SerialException as e:
@@ -1370,6 +1383,15 @@ class App:
         if v is not None:
             CONFIG["bt_retries"] = int(v)
 
+    def set_bt_delay(self):
+        v = ask_number("  Pause between Bluetooth requests", CONFIG["bt_delay"], 0, 2, "s")
+        if v is not None:
+            CONFIG["bt_delay"] = v
+
+    def toggle_slow_write(self):
+        CONFIG["bt_slow_write"] = not CONFIG["bt_slow_write"]
+        return "nopause"
+
     def set_outdir(self):
         p = ask(f"  Output folder [current {CONFIG['outdir']}, Enter=keep]: ")
         if p:
@@ -1421,6 +1443,9 @@ class App:
             (lambda: f"Download block size (Bluetooth): {CONFIG['bt_chunk']} bytes",
              self.set_chunk("bt_chunk", "Bluetooth")),
             (lambda: f"Bluetooth quick retries: {CONFIG['bt_retries']}", self.set_bt_retries),
+            (lambda: f"Bluetooth pause between requests: {CONFIG['bt_delay']:g} s", self.set_bt_delay),
+            (lambda: f"Bluetooth slow command write: {'on' if CONFIG['bt_slow_write'] else 'off'}",
+             self.toggle_slow_write),
             (lambda: f"Output folder: {CONFIG['outdir']}", self.set_outdir),
         ])
         return Menu("GPS742 logger manager", [

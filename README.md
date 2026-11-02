@@ -85,13 +85,29 @@ remote address, the incoming port carries `000000000000`.
 On a Bluetooth port the tool switches to a slower, safer mode:
 
 - waits up to 15 s for the link and retries the connection up to 3 times
-- 4 KB blocks with a 0.3 s pause between requests; the block size never changes
+- 4 KB blocks, no pause between requests by default (*Bluetooth pause between requests*,
+  0-2 s; raise it to 0.3 s if your adapter stalls); the block size never changes
 - NMEA output is turned off during the download and restored afterwards
 - fast give-up: a block that does not arrive within a few seconds is retried once
   (*Bluetooth quick retries*, 0-5), and a stalled write gives up at once
 - after that the data received so far is kept and the tool asks you to
   **power-cycle the logger, reconnect and resume** from the address where it stopped.
   You can also resume without reconnecting, save a `_partial` dump, or discard it
+- optional *Bluetooth slow command write* (off by default): each command is sent in 6-byte
+  pieces with a 0.1 s pause after each piece, as Ascen's gpsPhotoTagger does in its fast
+  download mode, so the module's input buffer is not overrun. Sending one request then takes
+  about 0.5 s. With a Realtek RTL8761BU dongle on Linux the GPS742 did not stall even without it
+  and without a pause (see below), so it stays off; turn it on if your adapter stalls
+
+Measured on Linux with a Realtek RTL8761BU USB dongle, 88 KB log, 4 KB blocks:
+
+| Slow command write | Pause | Time | Result |
+|---|---|---|---|
+| off | 0.3 s | 27.2 s (3.3 KB/s) | complete, 0 retries |
+| on | 0 s | 33.5 s | complete, 0 retries |
+| off | 0 s (default) | 20.7 s (4.3 KB/s) | complete, 0 retries, 6 runs in a row (about 530 KB) |
+
+The stalls described above were seen with an earlier setup; with this adapter they did not occur.
 
 A stalled Bluetooth transfer does not recover on its own (seen on both Linux and Windows),
 and smaller blocks do not help, so the recovery path is always a power cycle and a reconnect.
@@ -168,7 +184,10 @@ GPS742 logger manager
 │   ├── 3 GPS week rollover fix (auto / off)
 │   ├── 4 Download block size (USB)
 │   ├── 5 Download block size (Bluetooth)
-│   └── 6 Output folder
+│   ├── 6 Bluetooth quick retries (0-5)
+│   ├── 7 Bluetooth pause between requests (0-2 s)
+│   ├── 8 Bluetooth slow command write (on / off)
+│   └── 9 Output folder
 └── 0 Exit
 ```
 
@@ -241,7 +260,8 @@ Observed on a GPS742 with firmware `AXN_1.30-B_1.3_C01,000D,TSI_747PRO,1.0`:
 - **Bluetooth stalls.** The Bluetooth module stops sending when commands arrive back-to-back:
   with no pause between download requests it stalled within a few requests, with 0.1 s after
   about 110 KB. The GPS chip keeps answering over USB, and only a power cycle of the logger
-  brings the Bluetooth link back. With a 0.3 s pause a full download succeeded.
+  brings the Bluetooth link back. With a 0.3 s pause a full download succeeded. (Seen with an
+  earlier adapter; with a Realtek RTL8761BU dongle no pause was needed, see [Bluetooth](#bluetooth).)
 - **Bluetooth throughput.** Each request costs about 0.1 s plus about 0.22 s per KB (the dump is
   sent as hex text), so the link tops out near 4.5 KB/s. Measured with a 0.3 s pause:
   512 B blocks 1.0 KB/s, 1 KB 1.6 KB/s, 2 KB 2.35 KB/s, 4 KB 3.1 KB/s.
