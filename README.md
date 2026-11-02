@@ -259,8 +259,8 @@ Observed on a GPS742 with firmware `AXN_1.30-B_1.3_C01,000D,TSI_747PRO,1.0`:
 ## Older loggers
 
 An older TSI logger (firmware `B-core_1.1,0004,TSI747CD,1.0`, connected through a CP2102
-USB-serial bridge as `/dev/ttyUSB0`, 115200 bps) answers the logger commands (`PMTK182`) and the
-logger settings screen works, but it has no AGPS, beep or vibration sensor:
+USB-serial bridge as `/dev/ttyUSB0`, 115200 bps) works with this tool for logger settings and
+log download, but it has no AGPS, beep or vibration sensor:
 
 - `PMTK607` is answered with `$PMTK001,607,1` (invalid command), so the AGPS items report
   "not supported" and send nothing.
