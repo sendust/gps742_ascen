@@ -279,29 +279,27 @@ class Mtk:
         return int(self.log_get(9), 16)
 
     def read_memory(self, addr, length, timeout=None):
-        """Read one memory block. Returns None on failure."""
+        """Read one memory block. Returns (data, complete). On failure data is the part that
+        arrived intact and in order from addr, so the caller can request only the rest."""
         self.write(f"PMTK182,7,{addr:08X},{length:08X}")
         chunks = {}
+        acked = False
         for line in self.lines(10 * self.tscale if timeout is None else timeout):
             if line.startswith("$PMTK182,8,"):
                 f = check_line(line)
-                if not f:
-                    return None
                 try:
                     chunks[int(f[2], 16)] = bytes.fromhex(f[3])
-                except ValueError:
-                    return None
+                except (TypeError, ValueError):
+                    break            # damaged line: keep what came before it
             elif line.startswith("$PMTK001,182,7,"):
                 f = check_line(line)
-                if not f or f[3] != "3":
-                    return None
+                acked = bool(f) and f[3] == "3"
                 break
-        else:
-            return None
-        if not chunks or min(chunks) != addr:
-            return None
-        data = b"".join(chunks[k] for k in sorted(chunks))
-        return data if len(data) == length else None
+        data = b""
+        while addr + len(data) in chunks and len(data) < length:
+            data += chunks[addr + len(data)]
+        data = data[:length]
+        return data, acked and len(data) == length
 
     def drain(self, quiet=1.0, maxwait=20):
         """Wait until an in-progress memory dump stops streaming."""
@@ -935,41 +933,45 @@ class App:
         try:
             while addr < total:
                 try:
-                    size = min(chunk, total - addr)
-                    # Bluetooth: a block normally takes ~0.1 s + 0.22 s/KB, so give up quickly
-                    timeout = 3 + size / 1024 if bt else None
-                    block = None
-                    for attempt in range(attempts):
+                    end = min(addr + chunk, total)
+                    tries = 0
+                    # A failed request keeps the part that arrived and asks only for the rest;
+                    # the retry count starts again whenever a request brings new data.
+                    while addr < end and tries < attempts:
+                        # Bluetooth: a block normally takes ~0.1 s + 0.22 s/KB, so give up quickly
+                        timeout = 3 + (end - addr) / 1024 if bt else None
                         if bt:
                             time.sleep(CONFIG["bt_delay"])
                         try:
-                            block = dev.read_memory(addr, size, timeout)
+                            got, ok = dev.read_memory(addr, end - addr, timeout)
                         except DeviceError:
                             if bt:
                                 failures += 1
                                 break        # write timeout: the Bluetooth module has stalled
                             time.sleep(2)
-                        if block is not None:
+                            got, ok = b"", False
+                        data += got
+                        addr += len(got)
+                        if got:
+                            pct = addr * 100 // total
+                            rate = addr / max(time.time() - t0, 0.001) / 1024
+                            bar = "#" * (pct // 4)
+                            print(f"\r  [{bar:<25}] {pct:3d}%  {addr:,}/{total:,}  {rate:.1f} KB/s  "
+                                  f"retries {failures}", end="", flush=True)
+                        if ok:
                             break
                         failures += 1
+                        tries = 0 if got else tries + 1
                         dev.drain()
                         dev.flush_input()
-                    if block is None:
-                        if bt:
-                            print(f"\n  Bluetooth transfer stopped at 0x{addr:08X}. The logger's Bluetooth"
-                                  "\n  module does not recover by itself: power-cycle the logger and choose 1.")
-                        else:
-                            print(f"\n  Reading 0x{addr:08X} failed {attempts} times.")
-                        choice = self.download_failed(addr, total, saved_rates)
-                    else:
-                        data += block
-                        addr += size
-                        pct = addr * 100 // total
-                        rate = addr / max(time.time() - t0, 0.001) / 1024
-                        bar = "#" * (pct // 4)
-                        print(f"\r  [{bar:<25}] {pct:3d}%  {addr:,}/{total:,}  {rate:.1f} KB/s  "
-                              f"retries {failures}", end="", flush=True)
+                    if addr >= end:
                         continue
+                    if bt:
+                        print(f"\n  Bluetooth transfer stopped at 0x{addr:08X}. The logger's Bluetooth"
+                              "\n  module does not recover by itself: power-cycle the logger and choose 1.")
+                    else:
+                        print(f"\n  Reading 0x{addr:08X} failed {attempts} times.")
+                    choice = self.download_failed(addr, total, saved_rates)
                 except KeyboardInterrupt:
                     print("\n  Download paused. Waiting for the device output to settle...")
                     dev.drain()

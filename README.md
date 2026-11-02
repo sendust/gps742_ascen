@@ -11,7 +11,8 @@ change logger settings, download the log memory, and convert it to CSV and GPX.
 - Serial port list at startup: pick the logger, then enter the top menu
 - Number-driven menus: type a number and press Enter, `0` goes back (exits at the top menu)
 - Device info, live position status, raw NMEA view, hot/warm/cold restart
-- Full log download with per-block checksum check and retry
+- Full log download with per-block checksum check and retry; a block that stops partway keeps
+  what arrived and only the rest is requested again
 - Converts the raw dump to CSV and GPX (one track per local date, plus one GPX file per date)
 - Logger settings: start/stop logging, time/distance/speed interval, overwrite or stop when full, log fields
 - Beep and vibration sensor on / off (newer loggers, see [Older loggers](#older-loggers))
