@@ -18,6 +18,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from functools import reduce
+from urllib.request import Request, urlopen
 
 try:
     import serial
@@ -31,6 +32,9 @@ SECTOR_HEADER = 0x200
 GPS_WEEK_ROLLOVER = 1024 * 7 * 86400
 ROLLOVER_THRESHOLD = datetime(2012, 1, 1, tzinfo=timezone.utc).timestamp()
 MTK_VID = 0x0E8D
+GPS_EPOCH = datetime(1980, 1, 6, tzinfo=timezone.utc).timestamp()
+EPO_RECORD = 60              # one satellite in one 6-hour set
+EPO_SET = 32 * EPO_RECORD    # one 6-hour set: satellites 1-32
 
 # Logger values written by "Restore factory defaults" (PMTK182,1,<param>,<value>).
 # PMTK104 does not reset these on the GPS742, so they are written one by one.
@@ -50,8 +54,12 @@ CONFIG = {
     "bt_retries": 1,         # quick retries before asking to power-cycle and reconnect
     "bt_delay": 0.3,         # pause between Bluetooth requests (s); back-to-back requests
                              # stall the logger's Bluetooth module, so keep this pause
+    # 7-day MTK EPO (AGPS) file, the source used by Ascen's gpsPhotoTagger
+    "epo_url": "http://www.qstarz.com/ftp_folder/AGPS/MTK7d.BIN",
     "outdir": os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"),
 }
+# TSI vendor on/off settings ($PTSI<nnn>), found in Ascen's gpsPhotoTagger
+TSI_SWITCHES = {3: "Beep", 4: "Vibration"}
 NMEA_OFF = "PMTK314," + ",".join("0" * 19)   # all NMEA sentences off
 NMEA_DEFAULT = [-1]          # PMTK314,-1 restores the default NMEA output
 MIN_CHUNK = 0x80             # smallest download block size that can be set
@@ -130,6 +138,7 @@ class Mtk:
         except serial.SerialException as e:
             raise DeviceError(f"cannot open port: {e}")
         self.buf = b""
+        self.tsi_missing = set()     # PTSI settings this device did not answer
         if self.bluetooth:
             self.wait_link()
 
@@ -224,6 +233,24 @@ class Mtk:
                 return int(f[2])
         raise DeviceError(f"no acknowledgement: {body}")
 
+    # ---- TSI vendor settings ($PTSI<nnn>)
+
+    def tsi(self, num, value=None):
+        """Read (value=None) or set a TSI on/off setting: PTSI<num>,0 reads, PTSI<num>,2,<v>
+        sets, both answered with $PTSI<num>,1,<v>. Returns the value, or None if the device
+        does not answer (older loggers do not have these settings)."""
+        if num in self.tsi_missing:
+            return None
+        body = f"PTSI{num:03d},0" if value is None else f"PTSI{num:03d},2,{value}"
+        for _ in range(2):
+            self.write(body)
+            for line in self.lines(1.5 * self.tscale):
+                f = check_line(line) if line.startswith(f"$PTSI{num:03d},1,") else None
+                if f and f[2].isdigit():
+                    return int(f[2])
+        self.tsi_missing.add(num)
+        return None
+
     # ---- logger (PMTK182)
 
     def log_get(self, param):
@@ -284,6 +311,70 @@ class Mtk:
             line = self.readline(time.time() + 0.2)
             if line and line.startswith("$PMTK182,8"):
                 last = time.time()
+
+    # ---- AGPS / EPO (binary mode)
+
+    def epo_status(self):
+        """PMTK707: sets, first/last set (week, tow), first/last set usable at the current time.
+        Returns None if the receiver does not support EPO (PMTK607 rejected or not answered)."""
+        for _ in range(2):
+            self.write("PMTK607")
+            for line in self.lines(2 * self.tscale):
+                f = check_line(line) if line.startswith(("$PMTK707,", "$PMTK001,607,")) else None
+                if not f:
+                    continue
+                if f[0] == "PMTK001":
+                    return None          # invalid / unsupported command
+                try:
+                    return [int(x) for x in f[1:10]] if len(f) >= 10 else None
+                except ValueError:
+                    return None
+        return None
+
+    def bin_write(self, cmd, payload):
+        body = struct.pack("<HH", 9 + len(payload), cmd) + payload
+        try:
+            self.ser.write(b"\x04\x24" + body + bytes([reduce(lambda a, b: a ^ b, body)]) + b"\r\n")
+        except serial.SerialTimeoutException:
+            raise DeviceError(f"device does not accept data (write timeout). {self.stalled_hint()}")
+
+    def bin_read(self, timeout):
+        """Return (cmd, payload) of the next binary packet, or None. NMEA text is skipped."""
+        deadline = time.time() + timeout * self.tscale
+        while True:
+            i = self.buf.find(b"\x04\x24")
+            if i >= 0 and len(self.buf) >= i + 6:
+                n = struct.unpack("<H", self.buf[i + 2:i + 4])[0]
+                if len(self.buf) >= i + n:
+                    pkt, self.buf = self.buf[i:i + n], self.buf[i + n:]
+                    return struct.unpack("<H", pkt[4:6])[0], pkt[6:-3]
+            if time.time() >= deadline:
+                return None
+            self.buf += self.ser.read(self.ser.in_waiting or 1)
+
+    def epo_upload(self, data, progress=None):
+        """Send an EPO file in binary mode (PMTK253), 3 satellites per packet (cmd 722)."""
+        self.write("PMTK253,1,0")      # binary mode, keep the baud rate
+        time.sleep(0.5)
+        self.flush_input()
+        count = (len(data) + 3 * EPO_RECORD - 1) // (3 * EPO_RECORD)
+        try:
+            for seq in list(range(count)) + [0xFFFF]:          # 0xFFFF ends the upload
+                chunk = b"" if seq == 0xFFFF else data[seq * 180:seq * 180 + 180]
+                self.bin_write(722, struct.pack("<H", seq) + chunk.ljust(180, b"\0"))
+                r = self.bin_read(3)
+                if r is None or r[0] != 2 or r[1][:3] != struct.pack("<HB", seq, 1):
+                    raise DeviceError(f"packet {seq} not accepted ({'no answer' if r is None else r[1].hex()})")
+                if progress and seq != 0xFFFF:
+                    progress(seq + 1, count)
+                if self.bluetooth:
+                    time.sleep(CONFIG["bt_delay"])
+        finally:
+            self.bin_write(253, b"\x00" + struct.pack("<I", self.baud))   # back to NMEA mode
+            r = self.bin_read(3)
+            self.flush_input()
+        if r is None or r[1] != b"\xfd\x00\x03":
+            raise DeviceError(f"no answer when switching back to NMEA. {self.stalled_hint()}")
 
 
 # ---------------------------------------------------------------- log format
@@ -1013,6 +1104,9 @@ class App:
         print(f"  When full      : {'overwrite' if st['mode'] == 1 else 'stop logging'}")
         print(f"  Fields         : {', '.join(format_names(st['format']))}")
         print(f"  Usage          : {st['count']} records / {st['next_addr']:,} bytes")
+        for num, label in TSI_SWITCHES.items():
+            v = self.dev.tsi(num)
+            print(f"  {label:<15}: {'not supported' if v is None else 'on' if v else 'off'}")
 
     def set_interval(self, param, key, name, unit, hi):
         def run():
@@ -1038,6 +1132,23 @@ class App:
         else:
             report_ack(dev.command("PMTK182,4"))
             print("  Logging started.")
+
+    def toggle_tsi(self, num):
+        label = {3: "Beep", 4: "Vibration sensor"}[num]
+
+        def run():
+            dev = self.need()
+            cur = dev.tsi(num)
+            if cur is None:
+                print(f"  This logger does not support the {label.lower()} setting "
+                      f"(no answer to PTSI{num:03d}).")
+                return
+            new = dev.tsi(num, 0 if cur else 1)
+            if new is None:
+                print("  [Error] no answer from the device.")
+            else:
+                print(f"  {label} turned {'on' if new else 'off'}.")
+        return run
 
     def factory_defaults(self):
         dev = self.need()
@@ -1147,6 +1258,98 @@ class App:
         if s in ("0", "1", "2"):
             report_ack(self.need().command(f"PMTK301,{s}"))
 
+    # ---- AGPS (EPO)
+
+    def agps_supported(self):
+        """Return the EPO status, or None after telling the user AGPS is not supported."""
+        st = self.need().epo_status()
+        if st is None:
+            print("  This receiver does not support AGPS (EPO): PMTK607 was rejected or not answered.")
+        return st
+
+    def agps_status(self):
+        st = self.agps_supported()
+        if st is None:
+            return
+        if not st[0]:
+            print("  No AGPS (EPO) data on the device.")
+            return
+        first, last = gps_time(st[1], st[2]), gps_time(st[3], st[4]) + 6 * 3600
+        state = "valid" if first <= time.time() < last else (
+            "expired" if time.time() >= last else "not valid yet")
+        print(f"  EPO sets   : {st[0]} (6 hours each)")
+        print(f"  Covers     : {utc_text(first)} - {utc_text(last)}  ({state})")
+        if st[5]:
+            print(f"  In use     : {utc_text(gps_time(st[5], st[6]))} - "
+                  f"{utc_text(gps_time(st[7], st[8]) + 6 * 3600)}")
+        else:
+            print("  In use     : no (the receiver needs a valid time inside the covered range)")
+
+    def agps_update(self):
+        dev = self.need()
+        if self.agps_supported() is None:
+            return
+        print(f"  1. Download from {CONFIG['epo_url']}")
+        print("  2. Load an EPO file from disk")
+        s = ask("  Select (Enter=cancel): ")
+        try:
+            if s == "1":
+                print("  Downloading ...")
+                req = Request(CONFIG["epo_url"], headers={"User-Agent": "gps742"})
+                with urlopen(req, timeout=30) as r:
+                    data = r.read(1 << 20)
+            elif s == "2":
+                path = os.path.expanduser(ask("  File path: "))
+                if not path:
+                    return
+                with open(path, "rb") as f:
+                    data = f.read(1 << 20)
+            else:
+                return
+        except OSError as e:
+            print(f"  [Error] {e}")
+            return
+        try:
+            starts = epo_sets(data)
+        except ValueError as e:
+            print(f"  [Error] not an MTK EPO file: {e}")
+            return
+        end = starts[-1] + 6 * 3600
+        print(f"  EPO file   : {len(starts)} sets, {utc_text(starts[0])} - {utc_text(end)}")
+        if end <= time.time():
+            print("  [Warning] this data has already expired.")
+        if s == "1":
+            os.makedirs(CONFIG["outdir"], exist_ok=True)
+            path = os.path.join(CONFIG["outdir"], "MTK7d.BIN")
+            with open(path, "wb") as f:
+                f.write(data)
+            print(f"  Saved to   : {path}")
+        if dev.bluetooth:
+            print("  Uploading over Bluetooth is slow and may stall; USB is recommended.")
+        if not confirm("  Upload to the device (replaces the current AGPS data)?"):
+            print("  Cancelled.")
+            return
+        t0 = time.time()
+
+        def progress(n, total):
+            print(f"\r  Uploading  : {n}/{total} packets", end="", flush=True)
+        try:
+            dev.epo_upload(data, progress)
+        except DeviceError as e:
+            print(f"\n  [Error] {e}")
+            print("  If the logger stops sending NMEA, power-cycle it and upload again.")
+            return
+        print(f"  ({time.time() - t0:.1f} s)")
+        self.agps_status()
+
+    def agps_clear(self):
+        if self.agps_supported() is None:
+            return
+        if confirm("  Clear the AGPS (EPO) data on the device?"):
+            report_ack(self.need().command("PMTK127"))
+        else:
+            print("  Cancelled.")
+
     # ---- program settings
 
     def toggle_rollover(self):
@@ -1193,6 +1396,8 @@ class App:
             ("Set speed interval", self.set_interval(5, "speed", "Speed interval", "km/h", 1000)),
             ("When memory is full", self.set_mode),
             ("Select log fields", self.edit_format),
+            ("Beep on / off", self.toggle_tsi(3)),
+            ("Vibration sensor on / off", self.toggle_tsi(4)),
             ("Restore factory defaults", self.factory_defaults),
         ], header=self.settings_header)
         gps = Menu("GPS receiver settings", [
@@ -1201,6 +1406,9 @@ class App:
             ("Fix rate", self.set_fix_rate),
             ("SBAS on / off", self.toggle_sbas),
             ("DGPS mode", self.set_dgps),
+            ("AGPS (EPO) status", self.agps_status),
+            ("Update AGPS (EPO) data", self.agps_update),
+            ("Clear AGPS (EPO) data", self.agps_clear),
         ], header=self.gps_header)
         options = Menu("Connection / program settings", [
             ("Change port / baud rate", self.change_port),
@@ -1220,6 +1428,31 @@ class App:
             ("GPS receiver settings", gps),
             ("Connection / program settings", options),
         ], header=self.top_header, top=True)
+
+
+def gps_time(week, tow):
+    return GPS_EPOCH + week * 7 * 86400 + tow
+
+
+def epo_sets(data):
+    """Check an MTK EPO file; return the start time of each 6-hour set."""
+    if not data or len(data) % EPO_SET:
+        raise ValueError(f"size {len(data)} bytes is not a multiple of {EPO_SET}")
+    starts = []
+    for off in range(0, len(data), EPO_SET):
+        # satellite id 1-32 in order; 0 marks a satellite without data
+        ids = [data[off + i * EPO_RECORD + 3] for i in range(32)]
+        if any(sv not in (0, i + 1) for i, sv in enumerate(ids)) or not any(ids):
+            raise ValueError(f"set {off // EPO_SET} does not hold satellites 1-32")
+        hours = int.from_bytes(data[off:off + 3], "little")   # GPS hours since 1980-01-06
+        starts.append(GPS_EPOCH + hours * 3600)
+    if any(b - a != 6 * 3600 for a, b in zip(starts, starts[1:])):
+        raise ValueError("sets are not 6 hours apart")
+    return starts
+
+
+def utc_text(t):
+    return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def record_size(fmt):

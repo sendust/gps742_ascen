@@ -14,8 +14,10 @@ change logger settings, download the log memory, and convert it to CSV and GPX.
 - Full log download with per-block checksum check and retry
 - Converts the raw dump to CSV and GPX (one track per local date, plus one GPX file per date)
 - Logger settings: start/stop logging, time/distance/speed interval, overwrite or stop when full, log fields
+- Beep and vibration sensor on / off (newer loggers, see [Older loggers](#older-loggers))
 - Restore factory defaults: logger settings plus a full cold restart for the GPS receiver settings
 - GPS receiver settings: NMEA output sentences, fix rate, SBAS, DGPS
+- AGPS: download 7-day EPO data from the internet (or load a file) and upload it to the logger
 - GPS week rollover correction (see [Device notes](#device-notes))
 
 ## Requirements
@@ -104,6 +106,21 @@ echo 'KERNEL=="rfcomm*", ENV{ID_MM_DEVICE_IGNORE}="1"' | sudo tee /etc/udev/rule
 sudo udevadm control --reload
 ```
 
+## AGPS (EPO)
+
+*GPS receiver settings > Update AGPS (EPO) data* downloads the 7-day MediaTek EPO file
+(`MTK7d.BIN`, the source used by Ascen's own gpsPhotoTagger) or loads one from disk, checks it
+(28 sets of 6 hours, satellites 1-32), saves the download to the output folder and uploads it.
+The upload takes about 2 s over USB. Bluetooth works too, but is slower and can stall, so use USB.
+The download address is `CONFIG["epo_url"]` in `gps742.py`.
+
+All three AGPS items first query `PMTK607`; a receiver that rejects or ignores it is reported as
+not supporting AGPS, and nothing is downloaded or sent to it.
+
+*AGPS (EPO) status* shows the period the data covers and whether the receiver is using it.
+The receiver uses EPO only once it knows the current time, which this firmware takes from the
+satellites (it does not accept the time from the PC, `PMTK740`).
+
 ## Menu structure
 
 ```
@@ -132,13 +149,18 @@ GPS742 logger manager
 │   ├── 4 Set speed interval
 │   ├── 5 When memory is full (overwrite / stop)
 │   ├── 6 Select log fields
-│   └── 7 Restore factory defaults
+│   ├── 7 Beep on / off
+│   ├── 8 Vibration sensor on / off
+│   └── 9 Restore factory defaults
 ├── 4 GPS receiver settings
 │   ├── 1 NMEA output sentences
 │   ├── 2 Restore default NMEA output
 │   ├── 3 Fix rate
 │   ├── 4 SBAS on / off
-│   └── 5 DGPS mode
+│   ├── 5 DGPS mode
+│   ├── 6 AGPS (EPO) status
+│   ├── 7 Update AGPS (EPO) data
+│   └── 8 Clear AGPS (EPO) data
 ├── 5 Connection / program settings
 │   ├── 1 Change port / baud rate
 │   ├── 2 Reconnect
@@ -183,6 +205,20 @@ All commands are `$<body>*<XOR checksum>\r\n`.
 | `PMTK000` | test command (link check) |
 | `PMTK101` / `102` / `103` | hot / warm / cold restart |
 | `PMTK104` | full cold restart, resets GPS receiver settings (not logger settings) |
+| `PMTK607` → `PMTK707` | AGPS (EPO) status: sets, first/last set, sets in use (GPS week, time of week) |
+| `PMTK127` | clear AGPS (EPO) data |
+| `PMTK253,1,0` | switch to binary mode for the EPO upload |
+| `PTSI003,0` / `PTSI003,2,<v>` → `PTSI003,1,<v>` | query / set beep (1 on, 0 off) |
+| `PTSI004,0` / `PTSI004,2,<v>` → `PTSI004,1,<v>` | query / set vibration sensor (1 on, 0 off) |
+
+The EPO upload uses MTK binary packets: `04 24`, length (u16 LE, whole packet), command (u16 LE),
+payload, XOR of length..payload, `0D 0A`. Command 722 carries a sequence number (u16) and three
+60-byte satellite records; the logger answers command 2 with the sequence number and 1 (accepted).
+Sequence `0xFFFF` ends the upload, and command 253 with payload `00` + baud rate (u32) returns
+to NMEA mode.
+
+The `PTSI` commands are TSI vendor commands, found in Ascen's gpsPhotoTagger (the *Turn on Buzzer*
+and *Turn on Vibration Detector* check boxes). Query and set are both answered with the current value.
 
 Commands are acknowledged with `$PMTK001,<cmd>,[<sub>,]<flag>` (3 = success).
 Time, distance and speed intervals are stored in units of 0.1 s, 0.1 m and 0.1 km/h.
@@ -215,5 +251,19 @@ Observed on a GPS742 with firmware `AXN_1.30-B_1.3_C01,000D,TSI_747PRO,1.0`:
   logger values from `FACTORY_DEFAULTS` in `gps742.py`: fields `0x0002003F` (UTC, valid, lat, lon,
   height, speed, RCR), 1 s, 2 m, speed disabled, stop logging when full. Edit that table if your
   unit ships with different values.
+- **AGPS.** EPO data is stored with the full GPS week number (2026 data is accepted despite the
+  rollover). An EPO set with no data for a satellite has id 0 in that record.
 - Old tracks stay in memory until it is erased, so a download can contain several trips.
   Use the per-date GPX files when importing into a map app.
+
+## Older loggers
+
+An older TSI logger (firmware `B-core_1.1,0004,TSI747CD,1.0`, connected through a CP2102
+USB-serial bridge as `/dev/ttyUSB0`, 115200 bps) answers the logger commands (`PMTK182`) and the
+logger settings screen works, but it has no AGPS, beep or vibration sensor:
+
+- `PMTK607` is answered with `$PMTK001,607,1` (invalid command), so the AGPS items report
+  "not supported" and send nothing.
+- `PTSI003` / `PTSI004` get no answer, so *Logger settings* shows beep and vibration as
+  "not supported". The first time the screen opens it waits about 6 s for the answers; after
+  that the result is remembered until you reconnect.
