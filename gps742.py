@@ -918,6 +918,7 @@ class App:
             link = "Bluetooth" if self.dev.bluetooth else "USB/serial"
             state = f"{self.port} ({self.baud} bps, {link})"
         print(f"  Port    : {state}")
+        print(f"  Script  : revision {REVISION}")
         if self.fw:
             print(f"  Firmware: {self.fw}")
 
@@ -1630,12 +1631,39 @@ def format_rmc(f, gga, inview):
             f"sats {sats}/{inview}  HDOP {hdop}")
 
 
+def script_revision():
+    """Date/time this script was last changed, as "YYYY-MM-DD HH:MM".
+
+    Uses the last git commit of this file when the file has no uncommitted
+    changes (a checkout resets file times), otherwise the file's modification time.
+    """
+    path = os.path.abspath(__file__)
+    try:
+        cwd = os.path.dirname(path)
+        name = os.path.basename(path)
+        run = lambda *a: subprocess.run(["git", *a], cwd=cwd, capture_output=True,
+                                        text=True, timeout=3)
+        if not run("status", "--porcelain", "--", name).stdout.strip():
+            out = run("log", "-1", "--format=%cd", "--date=format-local:%Y-%m-%d %H:%M",
+                      "--", name).stdout.strip()
+            if out:
+                return out
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M")
+
+
+REVISION = script_revision()
+
+
 def main():
     ap = argparse.ArgumentParser(description="GPS742 (MTK) GPS logger manager")
+    ap.add_argument("-V", "--version", action="version", version=f"gps742.py revision {REVISION}")
     ap.add_argument("-p", "--port", help="serial port (default: choose from a list at startup)")
     ap.add_argument("-b", "--baud", type=int, default=DEFAULT_BAUD, help="baud rate (default 115200)")
     ap.add_argument("--convert", metavar="BIN", help="convert a .bin file without a device and exit")
     args = ap.parse_args()
+    print(f"gps742.py revision {REVISION}")
     if args.convert:
         convert(args.convert)
         return
