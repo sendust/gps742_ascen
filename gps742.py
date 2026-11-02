@@ -20,6 +20,10 @@ from datetime import datetime, timezone
 from functools import reduce
 from urllib.request import Request, urlopen
 
+# Script revision: date and time of the last feature change or improvement.
+# Update this whenever the script is changed.
+REVISION = "2026-11-02 21:35"
+
 try:
     import serial
     from serial.tools import list_ports
@@ -1629,31 +1633,6 @@ def format_rmc(f, gga, inview):
         sats, hdop, alt = gga[7], gga[8], gga[9]
     return (f"  {t}  {lat:.6f}, {lon:.6f}  alt {alt}m  {kmh:.1f}km/h  "
             f"sats {sats}/{inview}  HDOP {hdop}")
-
-
-def script_revision():
-    """Date/time this script was last changed, as "YYYY-MM-DD HH:MM".
-
-    Uses the last git commit of this file when the file has no uncommitted
-    changes (a checkout resets file times), otherwise the file's modification time.
-    """
-    path = os.path.abspath(__file__)
-    try:
-        cwd = os.path.dirname(path)
-        name = os.path.basename(path)
-        run = lambda *a: subprocess.run(["git", *a], cwd=cwd, capture_output=True,
-                                        text=True, timeout=3)
-        if not run("status", "--porcelain", "--", name).stdout.strip():
-            out = run("log", "-1", "--format=%cd", "--date=format-local:%Y-%m-%d %H:%M",
-                      "--", name).stdout.strip()
-            if out:
-                return out
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M")
-
-
-REVISION = script_revision()
 
 
 def main():

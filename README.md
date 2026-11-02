@@ -48,9 +48,9 @@ python3 gps742.py --convert logs/gps742_YYYYmmdd_HHMMSS.bin   # convert only, no
 python3 gps742.py -V                    # show the script revision and exit
 ```
 
-The script revision is printed at startup and shown in the main menu header. It is
-the date and time the script was last changed: the last git commit of `gps742.py`
-when the file has no uncommitted changes, otherwise the file's modification time.
+The script revision is printed at startup and shown in the main menu header. It is the
+`REVISION` constant near the top of `gps742.py`: the date and time of the last feature
+change or improvement, updated by hand with each change (not taken from the file time).
 
 Downloaded files are written to `logs/` next to the script:
 
