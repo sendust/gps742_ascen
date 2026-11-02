@@ -50,6 +50,12 @@ FACTORY_DEFAULTS = {
 CONFIG = {
     "rollover": "auto",      # auto | off
     "chunk": 0x800,          # download request size over USB (bytes)
+    # Older TSI loggers (firmware B-core_ >= 1.1 or M-core_ >= 2.0, as in Ascen's gpsPhotoTagger)
+    # can send their log at a higher serial speed: PMTK182,14,<baud> switches it until the
+    # next PMTK182,14 or a power cycle. Only used on USB/serial ports.
+    "fast_download": True,
+    "fast_baud": 460800,
+    "fast_chunk": 0x8000,    # download request size at fast_baud (bytes)
     "bt_chunk": 0x1000,      # download request size over Bluetooth (bytes)
     "bt_retries": 1,         # quick retries before asking to power-cycle and reconnect
     "bt_delay": 0.0,         # pause between Bluetooth requests (s). No pause was needed with a
@@ -144,6 +150,7 @@ class Mtk:
             raise DeviceError(f"cannot open port: {e}")
         self.buf = b""
         self.tsi_missing = set()     # PTSI settings this device did not answer
+        self.fast = False            # logger switched to CONFIG["fast_baud"]
         if self.bluetooth:
             self.wait_link()
 
@@ -177,7 +184,8 @@ class Mtk:
     def write(self, body):
         try:
             data = make_cmd(body)
-            if self.bluetooth and CONFIG["bt_slow_write"]:
+            # At fast_baud the logger drops commands that arrive in one piece
+            if self.fast or (self.bluetooth and CONFIG["bt_slow_write"]):
                 n = CONFIG["slow_write_piece"]
                 for i in range(0, len(data), n):
                     self.ser.write(data[i:i + n])
@@ -245,6 +253,55 @@ class Mtk:
                     return int(f[3])
                 return int(f[2])
         raise DeviceError(f"no acknowledgement: {body}")
+
+    # ---- fast download speed (older TSI loggers)
+
+    def set_baud(self, baud, fast):
+        """Switch the logger and the port to baud (PMTK182,14) and check that it answers."""
+        self.write(f"PMTK182,14,{baud}")
+        self.ser.flush()
+        time.sleep(0.2)
+        self.ser.baudrate = baud
+        self.fast = fast
+        time.sleep(0.3)
+        self.flush_input()
+        try:
+            self.query("PMTK605", "PMTK705,", retries=1)
+            return True
+        except DeviceError:
+            return False
+
+    def fast_on(self):
+        """Switch to CONFIG["fast_baud"]. On failure the port is back at the normal speed."""
+        try:
+            if self.set_baud(CONFIG["fast_baud"], True):
+                return True
+            if self.set_baud(self.baud, False):     # in case the logger did switch
+                return False
+        except DeviceError:
+            pass
+        self.ser.baudrate = self.baud
+        self.fast = False
+        self.flush_input()
+        return False
+
+    def fast_off(self):
+        return self.set_baud(self.baud, False)
+
+    def recover_baud(self):
+        """A download cut off at fast speed leaves the logger there until it is power-cycled.
+        Returns True if the logger answered at fast_baud and was switched back."""
+        self.ser.baudrate = CONFIG["fast_baud"]
+        self.fast = True
+        self.flush_input()
+        try:
+            self.query("PMTK605", "PMTK705,", retries=1)
+        except DeviceError:
+            self.ser.baudrate = self.baud
+            self.fast = False
+            self.flush_input()
+            return False
+        return self.fast_off()
 
     # ---- TSI vendor settings ($PTSI<nnn>)
 
@@ -835,7 +892,14 @@ class App:
                         raise
                     print(f"  {e} - retrying")
                     time.sleep(3)
-            self.fw = self.dev.firmware()
+            try:
+                self.fw = self.dev.firmware()
+            except DeviceError:
+                if bt or not self.dev.recover_baud():
+                    raise
+                print(f"  The logger was left at {CONFIG['fast_baud']} bps by an interrupted "
+                      f"download; switched it back to {self.baud} bps.")
+                self.fw = self.dev.firmware()
             print(f"  Connected: {self.port} ({self.baud} bps) / {self.fw}")
             if nmea_warning and not any(int(x) for x in self.dev.query("PMTK414", "PMTK514,")[1:]):
                 print("  * NMEA output is off (an interrupted Bluetooth download can leave it off).")
@@ -936,6 +1000,15 @@ class App:
         bt = dev.bluetooth
         chunk = CONFIG["bt_chunk"] if bt else CONFIG["chunk"]
         attempts = CONFIG["bt_retries"] + 1 if bt else 5
+        fast = not bt and CONFIG["fast_download"] and fast_capable(self.fw or "")
+        if fast:
+            if dev.fast_on():
+                chunk = CONFIG["fast_chunk"]
+                print(f"  Switched the logger to {CONFIG['fast_baud']} bps for the download.")
+            else:
+                fast = False
+                print(f"  The logger did not answer at {CONFIG['fast_baud']} bps; "
+                      f"downloading at {self.baud} bps.")
         print(f"  Downloading {total:,} bytes over {'Bluetooth' if bt else 'USB/serial'}, "
               f"{chunk} byte blocks (Ctrl+C to stop)")
         data = bytearray()
@@ -984,14 +1057,18 @@ class App:
                               "\n  module does not recover by itself: power-cycle the logger and choose 1.")
                     else:
                         print(f"\n  Reading 0x{addr:08X} failed {attempts} times.")
+                    self.normal_speed(dev)
                     choice = self.download_failed(addr, total, saved_rates)
                 except KeyboardInterrupt:
                     print("\n  Download paused. Waiting for the device output to settle...")
                     dev.drain()
                     dev.flush_input()
+                    self.normal_speed(dev)
                     choice = self.download_failed(addr, total, saved_rates)
                 if choice == "resume":
                     dev = self.dev      # a new connection after "reconnect and resume"
+                    if fast and not dev.fast_on():
+                        chunk = CONFIG["chunk"]
                     continue
                 if choice == "discard":
                     print("  Download discarded.")
@@ -999,6 +1076,7 @@ class App:
                 base += "_partial"
                 break
         finally:
+            self.normal_speed(dev)
             if saved_rates:
                 self.nmea_restore(saved_rates)
         print(f"\n  Received {len(data):,} bytes in {time.time() - t0:.1f} s, {failures} retries")
@@ -1010,6 +1088,18 @@ class App:
             json.dump(meta, f, ensure_ascii=False, indent=2)
         print(f"  Raw  : {base}.bin")
         convert(base + ".bin", st["format"])
+
+    def normal_speed(self, dev):
+        """Switch the logger back from the fast download speed, if it is there."""
+        if dev is None or not dev.fast:
+            return
+        try:
+            if dev.fast_off():
+                return
+        except DeviceError:
+            pass
+        print(f"\n  [Error] could not switch the logger back to {self.baud} bps. "
+              "Power-cycle it, then reconnect.")
 
     def nmea_off(self):
         """Turn NMEA output off for a Bluetooth download. Returns the rates to restore afterwards."""
@@ -1388,6 +1478,10 @@ class App:
         if v is not None:
             CONFIG["bt_delay"] = v
 
+    def toggle_fast_download(self):
+        CONFIG["fast_download"] = not CONFIG["fast_download"]
+        return "nopause"
+
     def toggle_slow_write(self):
         CONFIG["bt_slow_write"] = not CONFIG["bt_slow_write"]
         return "nopause"
@@ -1446,6 +1540,8 @@ class App:
             (lambda: f"Bluetooth pause between requests: {CONFIG['bt_delay']:g} s", self.set_bt_delay),
             (lambda: f"Bluetooth slow command write: {'on' if CONFIG['bt_slow_write'] else 'off'}",
              self.toggle_slow_write),
+            (lambda: f"Fast download for older loggers ({CONFIG['fast_baud']} bps): "
+                     f"{'on' if CONFIG['fast_download'] else 'off'}", self.toggle_fast_download),
             (lambda: f"Output folder: {CONFIG['outdir']}", self.set_outdir),
         ])
         return Menu("GPS742 logger manager", [
@@ -1455,6 +1551,17 @@ class App:
             ("GPS receiver settings", gps),
             ("Connection / program settings", options),
         ], header=self.top_header, top=True)
+
+
+def fast_capable(fw):
+    """Firmware that Ascen's gpsPhotoTagger downloads at 460800 bps: B-core_ >= 1.1,
+    otherwise M-core_ / Mcore_ >= 2.0."""
+    for prefix, minimum in (("B-core_", 1.1), ("M-core_", 2.0), ("Mcore_", 2.0)):
+        i = fw.find(prefix)
+        if i >= 0:
+            m = re.match(r"\d+(\.\d+)?", fw[i + len(prefix):])
+            return bool(m) and float(m.group()) >= minimum
+    return False
 
 
 def gps_time(week, tow):

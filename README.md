@@ -13,6 +13,7 @@ change logger settings, download the log memory, and convert it to CSV and GPX.
 - Device info, live position status, raw NMEA view, hot/warm/cold restart
 - Full log download with per-block checksum check and retry; a block that stops partway keeps
   what arrived and only the rest is requested again
+- Older TSI loggers download at 460800 bps over USB/serial, about 2.5 times faster (see [Older loggers](#older-loggers))
 - Converts the raw dump to CSV and GPX (one track per local date, plus one GPX file per date)
 - Logger settings: start/stop logging, time/distance/speed interval, overwrite or stop when full, log fields
 - Beep and vibration sensor on / off (newer loggers, see [Older loggers](#older-loggers))
@@ -187,7 +188,8 @@ GPS742 logger manager
 │   ├── 6 Bluetooth quick retries (0-5)
 │   ├── 7 Bluetooth pause between requests (0-2 s)
 │   ├── 8 Bluetooth slow command write (on / off)
-│   └── 9 Output folder
+│   ├── 9 Fast download for older loggers (on / off)
+│   └── 10 Output folder
 └── 0 Exit
 ```
 
@@ -217,6 +219,7 @@ All commands are `$<body>*<XOR checksum>\r\n`.
 | `PMTK182,4` / `PMTK182,5` | start / stop logging |
 | `PMTK182,6,1` | erase log memory |
 | `PMTK182,7,<addr>,<len>` → `PMTK182,8,<addr>,<hex>` | read log memory |
+| `PMTK182,14,<baud>` | change the serial speed until the next change or a power cycle (older TSI loggers, no acknowledgement) |
 | `PMTK314` / `PMTK414` | set / query NMEA output |
 | `PMTK220` / `PMTK400` | set / query fix rate |
 | `PMTK313` / `PMTK413` | set / query SBAS |
@@ -288,3 +291,23 @@ log download, but it has no AGPS, beep or vibration sensor:
 - `PTSI003` / `PTSI004` get no answer, so *Logger settings* shows beep and vibration as
   "not supported". The first time the screen opens it waits about 6 s for the answers; after
   that the result is remembered until you reconnect.
+
+### Fast download (older loggers)
+
+Ascen's gpsPhotoTagger downloads loggers with firmware `B-core_` 1.1 or later (or `M-core_` 2.0
+or later) at 460800 bps, and this tool does the same on USB/serial ports:
+
+1. `PMTK182,14,460800`, wait 0.2 s, reopen the port at 460800 bps and check that `PMTK605` is answered
+2. read the log in 32 KB blocks
+3. `PMTK182,14,115200` and back to 115200 bps, also when the download fails or is interrupted
+
+At 460800 bps the logger drops commands that arrive in one piece, so every command is sent in
+6-byte pieces with 0.1 s after each piece (as gpsPhotoTagger does). The logger answers at once.
+
+Measured on the TSI747CD (63 KB): 115200 bps with 2 KB blocks 13.3 s (4.6 KB/s), 115200 bps with
+32 KB blocks 12.1 s (5.1 KB/s), 460800 bps with 32 KB blocks 4.8 s (12.8 KB/s), same data.
+
+If the program stops during a fast download, the logger stays at 460800 bps until it is
+power-cycled. On the next connection the tool notices this, switches it back and says so.
+The GPS742 (`AXN_1.30` firmware) is not switched; over USB it is fast anyway.
+*Connection / program settings > Fast download for older loggers* turns this off.
