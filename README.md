@@ -279,6 +279,12 @@ Observed on a GPS742 with firmware `AXN_1.30-B_1.3_C01,000D,TSI_747PRO,1.0`:
   rollover). An EPO set with no data for a satellite has id 0 in that record.
 - Old tracks stay in memory until it is erased, so a download can contain several trips.
   Use the per-date GPX files when importing into a map app.
+- **Binary log download is not supported.** gpsPhotoTagger has a second download path for other
+  models: `PMTK253,1,<baud>` (binary mode), then `$LOG_DATA_READ,<n>,<n>` as plain text for each
+  64 KB sector, answered with 65,540 bytes. Tested over USB on 2026-11-02: the GPS742 enters
+  binary mode but only sends its 1 Hz binary position packets (command 1000), and the TSI747CD
+  ignores `PMTK253` and keeps sending NMEA. Neither sends log data, so the tool keeps using
+  `PMTK182,7` (hex text).
 
 ## Older loggers
 
