@@ -22,7 +22,7 @@ from urllib.request import Request, urlopen
 
 # Script revision: date and time of the last feature change or improvement.
 # Update this whenever the script is changed.
-REVISION = "2026-11-02 21:35"
+REVISION = "2026-11-04 10:33"
 
 try:
     import serial
@@ -1200,8 +1200,28 @@ class App:
         if not confirm("  ", "erase"):
             print("  Cancelled.")
             return
-        print("  Erasing... (can take up to a minute)")
-        report_ack(dev.command("PMTK182,6,1", timeout=90, retries=0))
+        while True:
+            print("  Erasing... (can take up to a minute)")
+            try:
+                report_ack(dev.command("PMTK182,6,1", timeout=90, retries=0))
+                return
+            except DeviceError:
+                pass
+            # Over Bluetooth the command or its acknowledgement can be lost: check the memory
+            print("  No acknowledgement from the logger. Checking the log memory...")
+            dev.flush_input()
+            try:
+                left = dev.log_status()["count"]
+            except DeviceError:
+                raise DeviceError("no acknowledgement for the erase command and the logger does "
+                                  f"not answer. {dev.stalled_hint()}")
+            if left == 0:
+                print("  Result: erased (the acknowledgement was lost)")
+                return
+            print(f"  Not erased: {left} records are still in memory.")
+            if not confirm("  Try again?", "erase"):
+                print("  Cancelled.")
+                return
 
     # ---- logger settings
 

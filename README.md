@@ -200,6 +200,9 @@ GPS742 logger manager
 
 Settings screens show the current values read from the device each time they are opened.
 Erasing the log memory asks you to type `erase`; restarts and restoring factory defaults ask for `yes`.
+If the erase acknowledgement does not arrive (seen over Bluetooth on Windows: the memory was erased
+but the reply was lost), the tool reads the record count: 0 is reported as erased, otherwise it
+offers to send the erase command again.
 In prompts that ask for a value, an empty Enter cancels.
 
 ## Screenshots
